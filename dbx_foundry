@@ -1,1 +1,148 @@
+# Databricks notebook: Query Foundry build statuses by RID, store into DataFrame, and post to Teams
 
+# 1) Setup & imports
+import requests
+import json
+from datetime import datetime
+from pyspark.sql import Row
+from pyspark.sql.functions import current_timestamp
+
+# 2) Configuration: change these to match your environment
+# - Create Databricks secret scope and store secrets:
+#   dbutils.secrets.get("<scope>", "<key>")
+#   Example secret keys used below: "foundry_base", "foundry_token", "teams_webhook"
+SECRET_SCOPE = "my_secret_scope"          # <= replace with your secret scope name
+FOUNDARY_BASE = dbutils.secrets.get(SECRET_SCOPE, "foundry_base")      # e.g. https://foundry.example.com
+FOUNDARY_TOKEN = dbutils.secrets.get(SECRET_SCOPE, "foundry_token")    # Foundry API token
+TEAMS_WEBHOOK = dbutils.secrets.get(SECRET_SCOPE, "teams_webhook")      # Teams incoming webhook URL
+
+# 3) Inputs: RIDs list source
+# Option A: pass RIDs via widget (comma-separated)
+dbutils.widgets.text("rids", "")  # e.g. "rid1,rid2,rid3"
+rids_widget = dbutils.widgets.get("rids").strip()
+
+# Option B: read from a file/table instead (uncomment and implement if needed)
+# Example: rids = spark.read.text("/mnt/mydata/rids.txt").rdd.map(lambda r: r[0].strip()).collect()
+
+if rids_widget:
+    rids = [r.strip() for r in rids_widget.split(",") if r.strip()]
+else:
+    # If no widget provided, fallback to an explicit list here
+    rids = [
+        # "RID_EXAMPLE_1",
+        # "RID_EXAMPLE_2",
+    ]
+
+if not rids:
+    raise ValueError("No RIDs provided. Pass them via the notebook widget 'rids' or populate the rids list in the code.")
+
+# 4) Foundry API call helper
+# NOTE: Replace the exact endpoint path with the Foundry API endpoint that returns build/status for a RID.
+# Example placeholder endpoint (you must confirm with your Foundry API docs):
+#   GET {FOUNDARY_BASE}/api/builds/{rid}  -> returns JSON with status fields
+#
+# If your Foundry endpoint is different, update the URL construction and parsing below.
+HEADERS = {
+    "Authorization": f"Bearer {FOUNDARY_TOKEN}",
+    "Content-Type": "application/json",
+    "Accept": "application/json"
+}
+
+def fetch_foundry_build_status(rid, timeout=30):
+    """
+    Fetch build status for a single RID from Foundry. Return dict with fields:
+      { "rid": rid, "status": ..., "details": ..., "fetched_at": ... }
+    Update the URL/path and JSON parsing to match your Foundry return structure.
+    """
+    # --- UPDATE THIS PATH to the actual Foundry API you have access to ---
+    url = f"{FOUNDARY_BASE}/api/builds/{rid}"   # <-- placeholder; change as needed
+
+    try:
+        resp = requests.get(url, headers=HEADERS, timeout=timeout)
+        resp.raise_for_status()
+        payload = resp.json()
+        # Example extraction — adapt to the actual payload:
+        # If your payload contains {"status":"SUCCESS","lastRun":{"id":"...","startedAt":"..."}}
+        status = payload.get("status") or payload.get("state") or payload.get("buildStatus")
+        details = payload.get("message") or payload.get("details") or json.dumps(payload)
+        fetched_at = datetime.utcnow().isoformat() + "Z"
+        return {
+            "rid": rid,
+            "status": status,
+            "details": details,
+            "payload": payload,
+            "fetched_at": fetched_at
+        }
+    except requests.exceptions.HTTPError as e:
+        return {
+            "rid": rid,
+            "status": "HTTP_ERROR",
+            "details": f"{e} - {resp.text if 'resp' in locals() else ''}",
+            "payload": None,
+            "fetched_at": datetime.utcnow().isoformat() + "Z"
+        }
+    except Exception as e:
+        return {
+            "rid": rid,
+            "status": "ERROR",
+            "details": str(e),
+            "payload": None,
+            "fetched_at": datetime.utcnow().isoformat() + "Z"
+        }
+
+# 5) Loop over RIDs, collect results
+results = []
+for rid in rids:
+    r = fetch_foundry_build_status(rid)
+    results.append(r)
+
+# 6) Convert to Spark DataFrame
+rows = [Row(rid=r["rid"], status=r["status"], details=r["details"], fetched_at=r["fetched_at"], raw_payload=json.dumps(r["payload"])) for r in results]
+df = spark.createDataFrame(rows).withColumn("processed_at", current_timestamp())
+display(df)   # Databricks display for quick inspection
+
+# 7) Persist results (optional)
+# Write to a Delta table or path for audit/history. Update the path or table name as needed.
+output_delta_path = "/mnt/delta/foundry_build_status"   # change to your mount/path
+(
+    df.write
+      .format("delta")
+      .mode("append")
+      .save(output_delta_path)
+)
+
+# Alternatively, create/append to a managed table
+# df.write.format("delta").mode("append").saveAsTable("foundry.build_status_history")
+
+# 8) Send summary to Teams
+def post_to_teams(webhook_url, title, text):
+    """
+    Minimal Teams message. For richer cards use the Office 365 Connector card/adaptive card JSON format.
+    Teams incoming webhook accepts {"text": "..."}. This sends a simple message.
+    """
+    payload = {
+        "text": f"**{title}**\n\n{text}"
+    }
+    resp = requests.post(webhook_url, json=payload, timeout=10)
+    try:
+        resp.raise_for_status()
+    except Exception as e:
+        # Log failure; do not fail the whole job
+        print(f"Failed to post to Teams: {e} - {resp.text if resp is not None else ''}")
+
+# Build a compact message summarizing statuses
+summary_lines = []
+for row in results:
+    rid = row["rid"]
+    status = row["status"]
+    # truncated details
+    details = str(row["details"])[:800] if row["details"] else ""
+    summary_lines.append(f"- {rid}: {status}. {details}")
+
+title = f"Foundry build status report ({len(results)} items)"
+text = "\n".join(summary_lines)
+
+post_to_teams(TEAMS_WEBHOOK, title, text)
+
+# 9) Done
+print("Done. Results written to:", output_delta_path)
