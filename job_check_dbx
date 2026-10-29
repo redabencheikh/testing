@@ -1,0 +1,749 @@
+# Databricks notebook source
+# DBTITLE 1,Overview
+# MAGIC %md
+# MAGIC
+# MAGIC # Databricks Jobs Status Monitor
+# MAGIC
+# MAGIC This notebook:
+# MAGIC 1. Fetches **all Databricks jobs** and their latest run status
+# MAGIC 2. Builds a summary table (job name, status, last run time, duration)
+# MAGIC 3. **Functional error checks** (even if jobs succeed, underlying issues may exist):
+# MAGIC    - **DPF Logs**: checks `dpf.dpf_logs` for error-level entries on the last execution of monitored jobs
+# MAGIC    - **Reconciliation**: checks `dpf.v_dpf_reconciliation_results` for failures on the last run (filtered by domain/job IDs)
+# MAGIC 4. Sends the combined report to a **Teams channel via Incoming Webhook**
+# MAGIC
+# MAGIC ### Configuration
+# MAGIC - Job IDs and domains to monitor are stored in `functional_checks_config.json` (same folder) for easy updates
+
+# COMMAND ----------
+
+# DBTITLE 1,Configuration and imports
+import requests
+import json
+from datetime import datetime, timezone, timedelta
+from databricks.sdk import WorkspaceClient
+
+org_id = spark.conf.get("spark.databricks.clusterUsageTags.clusterOwnerOrgId")
+match org_id:
+    case '6363023882820183':  # DEV
+        dbx_server = "DEV"
+    case '7513835574585907':  # TST
+        dbx_server = "TST"
+    case '245868703178258':  # MAI
+        dbx_server = "MAI"
+    case '876644492885963':  # PROD
+        dbx_server = "PROD"
+    case '7405615722220359':  # PROD2
+        dbx_server = "PROD2"
+    case _:
+        raise Exception(
+            'check if the org id are in [6363023882820183,7513835574585907,876644492885963,245868703178258,7405615722220359]')
+
+# --- Configuration ---
+WEBHOOK_URL = dbutils.widgets.get("webhook_url")
+
+# Initialise the Databricks SDK client (auto-authenticates on the workspace)
+w = WorkspaceClient()
+
+# COMMAND ----------
+
+# DBTITLE 1,Fetch all jobs and latest run status
+import os
+from databricks.sdk.service.jobs import RunLifeCycleState, RunResultState
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# ---- Load config (MONITORED_JOBS) ----
+CONFIG_PATH = os.path.join(
+    os.path.dirname(dbutils.notebook.entry_point.getDbutils().notebook().getContext().notebookPath().get()),
+    "functional_checks_config.json"
+)
+conf_file = dbutils.widgets.getArgument('conf_file')
+with open(conf_file, "r") as f:
+    func_config = json.load(f)
+
+MONITORED_JOBS = func_config["monitored_jobs"]
+RECON_DOMAINS = func_config["reconciliation"]["monitored_domains"]
+STALENESS_CONF = func_config.get("staleness", {})
+STALENESS_DEFAULT_HOURS = float(STALENESS_CONF.get("default_max_age_hours", 24))
+STALENESS_OVERRIDES = STALENESS_CONF.get("job_overrides", {})
+
+
+def _norm_days(days):
+    """Normalise weekday names to 3-letter uppercase codes (MON..SUN)."""
+    return {str(d).strip().upper()[:3] for d in (days or [])}
+
+
+WEEKDAY_CODES = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+
+
+STALENESS_DEFAULT_SKIP_DAYS = _norm_days(STALENESS_CONF.get("default_skip_days", []))
+print(f"Config loaded: {len(MONITORED_JOBS)} monitored jobs")
+print(f"Staleness threshold: {STALENESS_DEFAULT_HOURS}h by default, {len(STALENESS_OVERRIDES)} override(s)")
+
+
+# ---- Helper functions ----
+def _ts_to_str(epoch_ms):
+    """Convert epoch milliseconds to a readable UTC string."""
+    if not epoch_ms:
+        return "N/A"
+    return datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc).strftime("%m-%d %H:%M")
+
+
+def _duration_str(start_ms, end_ms):
+    """Human-readable duration between two epoch-ms timestamps."""
+    if not start_ms or not end_ms:
+        return "N/A"
+    secs = int((end_ms - start_ms) / 1000)
+    mins, secs = divmod(secs, 60)
+    hrs, mins = divmod(mins, 60)
+    if hrs:
+        return f"{hrs}h {mins}m {secs}s"
+    if mins:
+        return f"{mins}m {secs}s"
+    return f"{secs}s"
+
+
+def _age_hours(epoch_ms):
+    """Hours elapsed since an epoch-ms timestamp (None when unknown)."""
+    if not epoch_ms:
+        return None
+    return (datetime.now(timezone.utc).timestamp() * 1000 - epoch_ms) / 3_600_000
+
+
+def _age_str(hours):
+    """Human-readable age from a number of hours."""
+    if hours is None:
+        return "never"
+    if hours < 24:
+        return f"{hours:.1f}h"
+    days, rem = divmod(hours, 24)
+    return f"{int(days)}d {rem:.0f}h"
+
+
+def _job_staleness_conf(job_name):
+    """Resolve (max_age_hours, skip_days) for a job, accepting a plain number or an object override."""
+    override = STALENESS_OVERRIDES.get(job_name)
+    if override is None:
+        return STALENESS_DEFAULT_HOURS, STALENESS_DEFAULT_SKIP_DAYS
+    if isinstance(override, dict):
+        hours = float(override.get("max_age_hours", STALENESS_DEFAULT_HOURS))
+        skip = _norm_days(override["skip_days"]) if "skip_days" in override else STALENESS_DEFAULT_SKIP_DAYS
+        return hours, skip
+    return float(override), STALENESS_DEFAULT_SKIP_DAYS
+
+
+def _max_age_hours(job_name, now=None):
+    """Staleness threshold for a job, extended by 24h for every non-running day in the lookback window."""
+    base, skip_days = _job_staleness_conf(job_name)
+    if not skip_days:
+        return base
+
+    now = now or datetime.now(timezone.utc)
+    total = base
+    for _ in range(10):  # converges in a few passes; guard against pathological configs
+        window_days = int(total // 24)
+        skipped = sum(
+            1 for d in range(window_days + 1)
+            if WEEKDAY_CODES[(now - timedelta(days=d)).weekday()] in skip_days
+        )
+        new_total = base + 24 * skipped
+        if new_total == total:
+            break
+        total = new_total
+    return total
+
+
+# ---- Fetch all jobs (single API call, fast) ----
+all_jobs = list(w.jobs.list(expand_tasks=False))
+print(f"Found {len(all_jobs)} jobs in the workspace.")
+
+# ---- Filter to only monitored jobs BEFORE the expensive list_runs calls ----
+monitored_jobs = [j for j in all_jobs if j.settings and j.settings.name in MONITORED_JOBS]
+print(f"Filtered to {len(monitored_jobs)} monitored jobs. Fetching latest runs...")
+
+
+# ---- Fetch latest run for each monitored job (parallelized) ----
+def _fetch_job_status(job):
+    """Fetch latest run status for a single job."""
+    job_id = job.job_id
+    job_name = job.settings.name
+
+    runs = list(w.jobs.list_runs(job_id=job_id, limit=1))
+    try:
+        runs = list(w.jobs.list_runs(job_id=job.job_id, limit=1))
+    except Exception as e:
+        return {
+            "job_id": job.job_id,
+            "job_name": job.settings.name,
+            "lifecycle": "ERROR",
+            "result": str(e),
+            "last_run": "N/A",
+            "duration": "N/A",
+            "run_url": "",
+            "age": "never",
+            "max_age_hours": _max_age_hours(job.settings.name),
+            "is_stale": False,
+        }
+
+    max_age = _max_age_hours(job_name)
+
+    if runs:
+        r = runs[0]
+        state = r.state
+        life_cycle = state.life_cycle_state.value if state and state.life_cycle_state else "UNKNOWN"
+        result = state.result_state.value if state and state.result_state else "-"
+        start_time = _ts_to_str(r.start_time)
+        duration = _duration_str(r.start_time, r.end_time)
+        run_page = r.run_page_url or ""
+        age_h = _age_hours(r.start_time)
+        # a currently running job is never considered stale
+        is_stale = life_cycle != "RUNNING" and age_h is not None and age_h > max_age
+    else:
+        life_cycle = "NEVER_RUN"
+        result = "-"
+        start_time = "N/A"
+        duration = "N/A"
+        run_page = ""
+        age_h = None
+        is_stale = False
+
+    return {
+        "job_id": job_id,
+        "job_name": job_name,
+        "lifecycle": life_cycle,
+        "result": result,
+        "last_run": start_time,
+        "duration": duration,
+        "run_url": run_page,
+        "age": _age_str(age_h),
+        "max_age_hours": max_age,
+        "is_stale": is_stale,
+    }
+
+
+# Parallel execution — 15 jobsdpf_tst$0 at once
+job_rows = []
+with ThreadPoolExecutor(max_workers=min(15, len(monitored_jobs))) as executor:
+    futures = {executor.submit(_fetch_job_status, job): job for job in monitored_jobs}
+    for future in as_completed(futures):
+        job_rows.append(future.result())
+
+print(f"Collected status for {len(job_rows)} monitored jobs.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Build summary DataFrame
+from pyspark.sql import functions as F
+from pyspark.sql.types import StructType, StructField, StringType, LongType, DoubleType, BooleanType
+
+# Build Spark DataFrame from job_rows
+schema = StructType([
+    StructField("job_id", LongType(), True),
+    StructField("job_name", StringType(), True),
+    StructField("lifecycle", StringType(), True),
+    StructField("result", StringType(), True),
+    StructField("last_run", StringType(), True),
+    StructField("duration", StringType(), True),
+    StructField("run_url", StringType(), True),
+    StructField("age", StringType(), True),
+    StructField("max_age_hours", DoubleType(), True),
+    StructField("is_stale", BooleanType(), True),
+])
+
+df = spark.createDataFrame(job_rows, schema=schema)
+
+# Sort: failures first, then by last_run descending
+status_order = {"FAILED": 0, "INTERNAL_ERROR": 0, "TIMED_OUT": 1, "CANCELED": 2, "TERMINATED": 3, "RUNNING": 4,
+                "PENDING": 5, "NEVER_RUN": 6}
+FAILED_STATES = ["FAILED", "TIMEDOUT", "INTERNAL_ERROR","CANCELED"]
+order_expr = F.coalesce(
+    *[F.when(F.col("lifecycle") == k, F.lit(v)) for k, v in status_order.items()],
+    F.lit(99)
+)
+df = df.withColumn("_sort", order_expr).orderBy("_sort", F.col("last_run").desc()).drop("_sort")
+
+# Quick summary counters
+df.cache()
+total = df.count()
+success = df.filter(F.col("result") == "SUCCESS").count()
+failed = df.filter(F.col("result").isin(*FAILED_STATES)).count()
+running = df.filter(F.col("lifecycle") == "RUNNING").count()
+stale = df.filter(F.col("is_stale")).count()
+print(f"Summary  \u279c  Total: {total} | Success: {success} | Failed: {failed} | Running: {running} | Stale: {stale}")
+if stale > 0:
+    display(df.filter(F.col("is_stale")).select("job_name", "last_run", "age", "max_age_hours"))
+
+# COMMAND ----------
+
+# DBTITLE 1,Check DPF logs for functional errors
+# ---- Check dpf.dpf_logs for error-level logs today ----
+
+# ---- Helper: resolve workspace job names -> job IDs ----
+def get_workspace_job_ids() -> dict:
+    """Get all job IDs in the Databricks workspace.
+    Returns:
+        dict: A dictionary with job names as keys and job IDs as values.
+    """
+    _w = WorkspaceClient()
+    output = {}
+    for job in _w.jobs.list():
+        if job.settings and job.settings.name:
+            output[job.settings.name] = job.job_id
+    if len(output) == 0:
+        raise Exception(
+            "No job found in the workspace. Please check your config file."
+        )
+    return output
+
+# ---- Resolve monitored job IDs from the config job names ----
+all_workspace_jobs = get_workspace_job_ids()
+monitored_job_ids = [
+    str(all_workspace_jobs[name])
+    for name in MONITORED_JOBS
+    if name in all_workspace_jobs
+]
+
+missing = [name for name in MONITORED_JOBS if name not in all_workspace_jobs]
+if missing:
+    raise Exception(
+        f"{len(missing)} job name(s) from config not found in workspace: {missing}. "
+        "Please update functional_checks_config.json or check your workspace job names."
+    )
+
+print(f"Resolved {len(monitored_job_ids)} job ID(s) for the DPF logs query.")
+
+# ---- Build and run the DPF logs query ----
+job_ids_str = ", ".join(monitored_job_ids)
+
+dpf_logs_query = f"""
+with dpf_logs as (
+SELECT *, coalesce(context:attributes:domain, context:attributes:source) AS domain FROM (
+    SELECT * FROM dpf.dpf_logs
+    WHERE job_id IN ({job_ids_str})
+    QUALIFY rank() OVER (PARTITION BY job_id ORDER BY id DESC) = 1
+    ORDER BY logdate DESC
+)
+where level = 'error'
+)
+select job_id, count(*) as error_count
+from dpf_logs
+group by all
+"""
+
+df_log_errors = spark.sql(dpf_logs_query)
+df_log_errors.cache()
+log_error_count = df_log_errors.count()
+print(f"Found {log_error_count} log(s) for monitored jobs in DPF logs.")
+if log_error_count > 0:
+    display(df_log_errors)
+else:
+    print("  \u2705 No logs detected for monitored jobs in DPF logs.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Check DPF reconciliation results
+# ---- Check dpf.v_dpf_reconciliation_results for failures on last run ----
+
+# Build filter conditions
+recon_filters = []
+if RECON_DOMAINS:
+    domains_str = ",".join([f"'{d}'" for d in RECON_DOMAINS])
+    recon_filters.append(f"domain_name IN ({domains_str})")
+
+if recon_filters:
+    where_clause = " OR ".join(recon_filters)
+
+    recon_query = f"""
+    WITH last_reconciliation AS (
+        SELECT *
+        FROM dpf.v_dpf_reconciliation_results
+        QUALIFY ROW_NUMBER() OVER (PARTITION BY target_layer, table_name ORDER BY start_time DESC) = 1
+    ),unsuccessful AS (
+    SELECT DOMAIN_NAME, STEP, SOURCE_LAYER, TARGET_LAYER, JOB_NAME,
+           START_TIME, TABLE_NAME, COUNT_TARGET, COUNT_SOURCE, DIFFERENCE, SUCCESSFUL
+    FROM last_reconciliation
+    WHERE SUCCESSFUL = false
+      AND ({where_clause})
+    )
+    SELECT distinct DOMAIN_NAME, TARGET_LAYER, SUCCESSFUL
+    FROM unsuccessful
+    """
+
+    df_recon_failures = spark.sql(recon_query)
+    df_recon_failures.cache()
+    recon_fail_count = df_recon_failures.count()
+    print(f"Found {recon_fail_count} reconciliation failure(s) on last run.")
+    if recon_fail_count > 0:
+        display(df_recon_failures)
+    else:
+        print("  \u2705 No reconciliation failures detected.")
+else:
+    df_recon_failures = spark.createDataFrame([], StructType([]))
+    print(" No domains or job IDs configured for reconciliation check. Update functional_checks_config.json.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Build Teams Adaptive Card payload
+TEAMS_CARD_MAX_BYTES = 27_000  # stay safely under the 28 KB Teams limit
+
+
+def _resolve_job_name(job_id):
+    """Resolve a job_id to its human-readable name."""
+    for k, v in all_workspace_jobs.items():
+        if v == int(job_id):
+            return k
+    raise ValueError(f"Job ID {job_id} not found")
+
+
+def _status_emoji(lifecycle, result, is_stale=False):
+    """Return an emoji reflecting the job outcome."""
+    if lifecycle == "RUNNING":
+        return "▶️"
+    if is_stale:
+        return "⏰"
+    if result == "SUCCESS":
+        return "✅"
+    if result in ("FAILED", "TIMEDOUT"):
+        return "❌"
+    return "⚠️"
+
+
+def _status_color(lifecycle, result, is_stale=False):
+    """Return an Adaptive Card color keyword based on job status."""
+    if result in ("FAILED", "TIMEDOUT") or lifecycle == "INTERNAL_ERROR":
+        return "Attention"
+    if is_stale:
+        return "Warning"
+    if lifecycle == "RUNNING":
+        return "Accent"
+    if result == "SUCCESS":
+        return "Good"
+    return "Warning"
+
+
+def _job_row_block(row):
+    """One ColumnSet row for a job — fixed-width columns, colored name, clickable link."""
+    emoji = _status_emoji(row["lifecycle"], row["result"], row["is_stale"])
+    color = _status_color(row["lifecycle"], row["result"], row["is_stale"])
+    name  = row["job_name"]  # no truncation — wrap handles it
+
+    name_block = {
+        "type": "TextBlock",
+        "text": name,
+        "size": "Small",
+        "wrap": True,
+        "color": color,
+    }
+    # Keep row-level quick access to the run page when available.
+    # Note: TextBlock does not support selectAction in Adaptive Cards -> use a markdown link instead.
+    if "run_url" in row and row["run_url"]:
+        name_block["text"] = f"[{name}]({row['run_url']})"
+
+    # Add an explicit link only for failed/error states to speed up troubleshooting from Teams.
+    failed_states = {"FAILED", "TIMEDOUT", "INTERNAL_ERROR", "ERROR"}
+    is_failed = (row["result"] in failed_states) or (row["lifecycle"] in failed_states)
+    run_link_block = {
+        "type": "TextBlock",
+        "text": "-",
+        "size": "Small",
+        "isSubtle": True,
+    }
+    if is_failed and row["run_url"]:
+        run_link_block = {
+            "type": "TextBlock",
+            "text": f"[Open Run]({row['run_url']})",
+            "size": "Small",
+            "color": "Attention",
+            "weight": "Bolder",
+        }
+
+    return {
+        "type": "ColumnSet",
+        "columns": [
+            {
+                "type": "Column", "width": "auto",
+                "items": [{"type": "TextBlock", "text": emoji, "size": "Small"}],
+                "verticalContentAlignment": "Center",
+            },
+            {
+                "type": "Column", "width": "stretch",
+                "items": [name_block],
+                "verticalContentAlignment": "Center",
+            },
+            {
+                "type": "Column", "width": "110px",
+                "items": [{"type": "TextBlock", "text": row["last_run"], "size": "Small", "isSubtle": True}],
+                "verticalContentAlignment": "Center",
+            },
+            {
+                "type": "Column", "width": "75px",
+                "items": [run_link_block],
+                "verticalContentAlignment": "Center",
+                # Column supports selectAction: makes the whole cell clickable for failed jobs
+                **({"selectAction": {"type": "Action.OpenUrl", "url": row["run_url"]}} if is_failed and row[
+                    "run_url"] else {}),
+            },
+        ],
+    }
+
+
+def _build_functional_errors_section(df_log_errors, df_recon_failures):
+    """Build Adaptive Card body elements for functional error checks."""
+    sections = []
+
+    # --- Section: DPF Log Errors ---
+    sections.append({
+        "type": "TextBlock",
+        "text": "🐞 Functional Errors (DPF Logs)",
+        "weight": "Bolder",
+        "size": "Medium",
+        "separator": True,
+    })
+
+    log_rows = df_log_errors.collect() if df_log_errors is not None and df_log_errors.count() > 0 else []
+
+    if log_rows:
+        sections.append({
+            "type": "TextBlock",
+            "text": f"❌ {df_log_errors.count()} error(s) detected:",
+            "size": "Small",
+            "color": "Attention",
+        })
+        # Table header for DPF log errors
+        sections.append({
+            "type": "ColumnSet",
+            "style": "emphasis",
+            "columns": [
+                {"type": "Column", "width": "stretch",
+                 "items": [{"type": "TextBlock", "text": "Job Name", "weight": "Bolder", "size": "Small"}]},
+                {"type": "Column", "width": "80px",
+                 "items": [{"type": "TextBlock", "text": "Errors", "weight": "Bolder", "size": "Small"}]},
+            ],
+        })
+
+        for row in log_rows:
+            error_count = str(row["error_count"] or "N/A")
+            job_id = str(row["job_id"] or "N/A")
+            sections.append({
+                "type": "ColumnSet",
+                "columns": [
+                    {"type": "Column", "width": "stretch", "items": [
+                        {"type": "TextBlock", "text": _resolve_job_name(job_id), "size": "Small", "wrap": True,
+                         "color": "Attention"}]},
+                    {"type": "Column", "width": "80px",
+                     "items": [{"type": "TextBlock", "text": error_count, "size": "Small", "color": "Attention"}]},
+                ],
+            })
+    else:
+        sections.append({
+            "type": "TextBlock",
+            "text": "✅ No functional errors in DPF logs.",
+            "size": "Small",
+            "color": "Good",
+        })
+
+    # --- Section: Reconciliation Failures ---
+    sections.append({
+        "type": "TextBlock",
+        "text": "⚖️ Reconciliation Check",
+        "weight": "Bolder",
+        "size": "Medium",
+        "separator": True,
+    })
+
+    recon_rows = df_recon_failures.collect() if df_recon_failures is not None and df_recon_failures.count() > 0 else []
+
+    if recon_rows:
+        sections.append({
+            "type": "TextBlock",
+            "text": f"❌ {df_recon_failures.count()} reconciliation failure(s) on last run:",
+            "size": "Small",
+            "color": "Attention",
+        })
+        # Table header
+        sections.append({
+            "type": "ColumnSet",
+            "style": "emphasis",
+            "columns": [
+                {"type": "Column", "width": "stretch",
+                 "items": [{"type": "TextBlock", "text": "Domain", "weight": "Bolder", "size": "Small"}]},
+                {"type": "Column", "width": "80px",
+                 "items": [{"type": "TextBlock", "text": "Layer", "weight": "Bolder", "size": "Small"}]},
+                {"type": "Column", "width": "60px",
+                 "items": [{"type": "TextBlock", "text": "Status", "weight": "Bolder", "size": "Small"}]},
+                # "Successful" → "Status", wider
+            ],
+        })
+        for row in recon_rows:
+            sections.append({
+                "type": "ColumnSet",
+                "columns": [
+                    {"type": "Column", "width": "stretch", "items": [
+                        {"type": "TextBlock", "text": str(row["DOMAIN_NAME"] or ""), "size": "Small", "wrap": True,
+                         "color": "Attention"}]},
+                    {"type": "Column", "width": "80px", "items": [
+                        {"type": "TextBlock", "text": str(row["TARGET_LAYER"] or ""), "size": "Small",
+                         "isSubtle": True}]},
+                    {"type": "Column", "width": "60px",
+                     "items": [{"type": "TextBlock", "text": "❌ False", "size": "Small", "color": "Attention"}]},
+                ],
+            })
+    else:
+        sections.append({
+            "type": "TextBlock",
+            "text": "✅ No reconciliation failures detected.",
+            "size": "Small",
+            "color": "Good",
+        })
+
+    return sections
+
+
+def highlight(value, is_bad):
+    if is_bad:
+        return f"🚨 {value}"
+    return f"✅ {value}"
+
+
+def build_adaptive_card(df, total, success, failed, running, df_log_errors=None, df_recon_failures=None):
+    """Build a compact Adaptive Card — job status + functional checks."""
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+    # Exclude NEVER_RUN jobs from counts and display
+    active_df = df.filter(F.col("lifecycle") != "NEVER_RUN")
+    active_total = active_df.count()
+    never_run_count = total - active_total
+
+    # never run jobs
+    never_run_df = df.filter(F.col("lifecycle") == "NEVER_RUN")
+
+    # Count functional issues
+    log_error_count = df_log_errors.count() if df_log_errors is not None and len(df_log_errors.columns) > 0 else 0
+    recon_fail_count = df_recon_failures.count() if df_recon_failures is not None and len(
+        df_recon_failures.columns) > 0 else 0
+
+    # Overall status color for the header
+    overall_color = "Attention" if (failed > 0 or log_error_count > 0 or recon_fail_count > 0) else "Good"
+
+    def fmt(n):
+        return f"{int(n):,}"
+
+    header_facts = [
+        {"title": "Environment", "value": dbx_server},
+        {"title": "Report Time", "value": now_str},
+
+        {"title": "Total Jobs", "value": fmt(total)},
+        {"title": "▶️ Running", "value": fmt(running)},
+
+        {"title": "✅ Success", "value": fmt(success)},
+        {"title": "❌ Failed", "value": highlight(failed, failed > 0)},
+        {"title": "⚠️ Never Run", "value": highlight(never_run_count, never_run_count > 0)},
+
+        {"title": "🐞 Func Errors", "value": highlight(log_error_count, log_error_count > 0)},
+        {"title": "⚖️ Recon Failures", "value": highlight(recon_fail_count, recon_fail_count > 0)},
+    ]
+
+    # ---- Jobs table header (matches new _job_row_block columns) ----
+    table_header = {
+        "type": "ColumnSet",
+        "style": "emphasis",
+        "columns": [
+            {"type": "Column", "width": "auto",
+             "items": [{"type": "TextBlock", "text": "", "size": "Small", "weight": "Bolder"}]},
+            {"type": "Column", "width": "stretch",
+             "items": [{"type": "TextBlock", "text": "Job Name", "size": "Small", "weight": "Bolder"}]},
+            {"type": "Column", "width": "110px",
+             "items": [{"type": "TextBlock", "text": "Last Run", "size": "Small", "weight": "Bolder"}]},
+            {"type": "Column", "width": "75px",
+             "items": [{"type": "TextBlock", "text": "Run", "size": "Small", "weight": "Bolder"}]},
+        ],
+    }
+
+    job_blocks = [table_header]
+    for row in active_df.collect():
+        job_blocks.append(_job_row_block(row))
+
+    # ---- Build full card body ----
+    body = [
+               {
+                   "type": "TextBlock",
+                   "text": f"📊 DPF Jobs Status Report [{dbx_server}]",
+                   "weight": "Bolder",
+                   "size": "Large",
+                   "color": overall_color,
+               },
+               {"type": "FactSet", "facts": header_facts},
+               {"type": "TextBlock", "text": "All Monitored Jobs", "weight": "Bolder", "size": "Medium",
+                "separator": True},
+           ] + job_blocks
+
+    if never_run_df.count() > 0:
+        body.append({
+            "type": "TextBlock",
+            "text": "⚠️ Jobs Never Run",
+            "weight": "Bolder",
+            "size": "Medium",
+            "separator": True,
+        })
+
+        for row in never_run_df.collect():
+            body.append({
+                "type": "TextBlock",
+                "text": f"• {row['job_name']}",
+                "size": "Small",
+                "isSubtle": True,
+            })
+
+    # ---- Append functional error sections ----
+    func_sections = _build_functional_errors_section(df_log_errors, df_recon_failures)
+    body.extend(func_sections)
+
+    card = {
+        "type": "message",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "contentUrl": None,
+            "content": {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard",
+                "version": "1.4",
+                "body": body,
+            },
+        }],
+    }
+    return card
+
+
+# Build the card with all checks included
+card_payload = build_adaptive_card(
+    df, total, success, failed, running,
+    df_log_errors=df_log_errors,
+    df_recon_failures=df_recon_failures
+)
+payload_size = len(json.dumps(card_payload).encode("utf-8"))
+print(f"Adaptive Card payload built \u2713  ({payload_size:,} bytes / {payload_size / 1024:.1f} KB)")
+print(f"Under 28 KB limit: {payload_size < TEAMS_CARD_MAX_BYTES}")
+if payload_size > TEAMS_CARD_MAX_BYTES:
+    raise Exception(
+        f"Payload exceeds Teams limit of 28 KB ({payload_size / 1024:.1f} KB). Consider reducing the number of jobs or truncating messages.")
+
+# COMMAND ----------
+
+# DBTITLE 1,Send report to Teams webhook
+# ---- Send to Teams webhook ----
+if not WEBHOOK_URL:
+    print("  WEBHOOK_URL widget is empty — skipping send.")
+    print("   Paste your Teams Incoming Webhook URL into the widget above and re-run.")
+else:
+    resp = requests.post(
+        WEBHOOK_URL,
+        headers={"Content-Type": "application/json"},
+        data=json.dumps(card_payload),
+        timeout=30,
+    )
+    if resp.status_code in (200, 202):
+        print(f"✅ Message sent successfully to Teams! (HTTP {resp.status_code})")
+    else:
+        print(f"❌ Failed to send message. HTTP {resp.status_code}")
+        print(resp.text)
+
